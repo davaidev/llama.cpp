@@ -1883,7 +1883,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        // CrabiX patch (docs/local-retrieval.md): a pooled embeddings context never reads logits; skip the full-vocab copy.
+        if (!(cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) && logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
