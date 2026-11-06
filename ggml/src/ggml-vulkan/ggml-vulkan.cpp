@@ -345,9 +345,17 @@ void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         ctx->almost_ready_fence_pending = false;
     }
 
-    // Spin (w/pause) waiting for the graph to finish executing.
+    // Spin (w/pause) waiting for the graph to finish executing, then block:
+    // a spinning waiter that the OS deschedules under CPU load misses the
+    // fence by a whole scheduler quantum, while a blocked one is woken (and
+    // boosted) when the fence signals.
+    constexpr int spin_rounds = 64;
     vk::Result result;
-    for (;;) {
+    for (int round = 0;; ++round) {
+        if (round >= spin_rounds) {
+            VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX), "fence after spin", ctx->device);
+            break;
+        }
         try {
             result = ctx->device->device.getFenceStatus(ctx->fence);
         } catch (vk::DeviceLostError &) {
