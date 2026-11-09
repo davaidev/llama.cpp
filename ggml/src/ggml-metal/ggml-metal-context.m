@@ -471,6 +471,125 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+// a graph with at least this many tokens per MUL_MAT is a prompt batch: it is
+// computed in GGML_METAL_ABORT_CHUNKS command buffers, committed one at a time,
+// so an abort callback stops it between chunks instead of after the whole graph
+//
+// the max src1->ne[1] over MUL_MATs is n_tokens for a single-sequence batch; a
+// decode of >= 32 sequences, or a non-fused GDN chunking pass (padded to 64),
+// also qualifies: still correct, only chunked
+#define GGML_METAL_ABORT_MIN_TOKENS 32
+#define GGML_METAL_ABORT_CHUNKS     16
+
+static int64_t ggml_metal_graph_n_tokens(const struct ggml_cgraph * gf) {
+    int64_t n = 1;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        const struct ggml_tensor * t = gf->nodes[i];
+        if (t->op == GGML_OP_MUL_MAT && t->src[1] != NULL) {
+            n = MAX(n, t->src[1]->ne[1]);
+        }
+    }
+    return n;
+}
+
+static void ggml_metal_encode_range(ggml_metal_t ctx, id<MTLCommandBuffer> cmd_buf, int idx_start, int idx_end) {
+    ggml_metal_op_t ctx_op = ggml_metal_op_init(
+        ctx->dev,
+        cmd_buf,
+        ctx->gf,
+        ctx->finfo,
+        idx_start,
+        idx_end,
+        ctx->use_concurrency,
+        false,
+        ctx->debug_graph);
+
+    for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
+        const int res = ggml_metal_op_encode(ctx_op, idx);
+        if (res == 0) {
+            break;
+        }
+
+        idx += res - 1;
+    }
+
+    ggml_metal_op_free(ctx_op);
+}
+
+// the graph in chunks, at most two committed at a time: chunk c is encoded while
+// c - 1 runs, committed after the abort callback said no, and only then is c - 1
+// waited on, so the GPU never idles between chunks and an abort waits for at most
+// two chunks. on abort nothing is left running. the last chunk is left running,
+// as the single-buffer path leaves the whole graph
+//
+// on an abort llama_decode returns 2 but cannot roll a recurrent / hybrid memory
+// back by a whole ubatch (rs_max): the caller restores its own state checkpoint
+static enum ggml_status ggml_metal_graph_compute_abortable(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    int bounds[GGML_METAL_ABORT_CHUNKS + 1];
+    {
+        const int per = (gf->n_nodes + GGML_METAL_ABORT_CHUNKS - 1) / GGML_METAL_ABORT_CHUNKS;
+
+        int i = 0;
+        bounds[0] = 0;
+        for (int c = 1; c < GGML_METAL_ABORT_CHUNKS; ++c) {
+            const int target = MIN(c*per, gf->n_nodes);
+            while (i < target) {
+                // a fusion cannot span two command buffers
+                i += ggml_metal_fusion_max(gf, i);
+            }
+            bounds[c] = MIN(i, gf->n_nodes);
+        }
+        bounds[GGML_METAL_ABORT_CHUNKS] = gf->n_nodes;
+    }
+
+    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+    // committed and not yet waited on
+    id<MTLCommandBuffer> running = nil;
+
+    for (int c = 0; c < GGML_METAL_ABORT_CHUNKS; ++c) {
+        if (bounds[c] >= bounds[c + 1]) {
+            continue;
+        }
+
+        id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+
+        ggml_metal_encode_range(ctx, cmd_buf, bounds[c], bounds[c + 1]);
+
+        const bool aborted = ctx->abort_callback(ctx->abort_callback_data);
+
+        if (!aborted) {
+            [cmd_buf commit];
+
+            // released by ggml_metal_synchronize once completed
+            [cmd_buf retain];
+            [ctx->cmd_bufs_ext addObject:cmd_buf];
+            ctx->cmd_buf_last = cmd_buf;
+        }
+
+        if (running != nil) {
+            [running waitUntilCompleted];
+
+            if ([running status] != MTLCommandBufferStatusCompleted) {
+                GGML_LOG_ERROR("%s: error: command buffer failed with status %d\n", __func__, (int) [running status]);
+                if ([running status] == MTLCommandBufferStatusError) {
+                    GGML_LOG_ERROR("error: %s\n", [[running error].localizedDescription UTF8String]);
+                }
+                ctx->has_error = true;
+                return GGML_STATUS_FAILED;
+            }
+        }
+
+        if (aborted) {
+            return GGML_STATUS_ABORTED;
+        }
+
+        running = cmd_buf;
+    }
+
+    return GGML_STATUS_SUCCESS;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -489,6 +608,17 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
 
     // keep the memory wired
     ggml_metal_device_rsets_keep_alive(ctx->dev);
+
+    // a prompt batch with an abort callback set: abortable between chunks
+    // (no capture pending: a capture keeps the original single-graph path)
+    if (ctx->abort_callback != NULL && ctx->capture_compute <= 0 &&
+        ggml_metal_graph_n_tokens(gf) >= GGML_METAL_ABORT_MIN_TOKENS) {
+        @autoreleasepool {
+            ctx->gf = gf;
+
+            return ggml_metal_graph_compute_abortable(ctx, gf);
+        }
+    }
 
     // submit the ggml compute graph to the GPU by creating command buffers and encoding the ops in them
     // the first n_main nodes are encoded and submitted for processing directly by the calling thread
